@@ -1,0 +1,6 @@
+pandas
+requests
+beautifulsoup4
+pypdf
+openpyxl
+playwright

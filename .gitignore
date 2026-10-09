@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+scraper_data/
+Scraper_data/
+User_Data/
