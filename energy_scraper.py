@@ -1,5 +1,6 @@
 import argparse
 import re
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Callable
 from urllib.parse import urljoin, urlparse
@@ -22,7 +23,12 @@ try:
 except Exception:
     PLAYWRIGHT_AVAILABLE = False
 
-DATA_DIR = Path.cwd() / "scraper_data"
+APP_DIR = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+)
+DATA_DIR = APP_DIR / "scraper_data"
 
 # Broad Belgium candidate list. The script auto-filters to suppliers that
 # appear to offer both electricity and gas (dual fuel).
@@ -116,7 +122,7 @@ DIRECT_TARIFF_SEEDS: dict[str, list[str]] = {
         "https://www.watz.be/tarieven",
     ],
     "EBEM": [
-        "https://www.ebem.be/nl/tarieven",
+        "https://www.ebem.be/tarieven/tarieven/",
         "https://www.ebem.be/tarieven",
     ],
 }
@@ -274,6 +280,7 @@ def qualifies_as_dual_fuel(base_url: str) -> tuple[bool, str]:
     try:
         response = request_with_retry(base_url)
     except Exception as exc:
+        print(f"[WARN] Leverancierscontrole mislukt voor {base_url}: {exc}", flush=True)
         return False, f"fetch_error: {exc}"
 
     soup = BeautifulSoup(response.text, "html.parser")
@@ -502,11 +509,30 @@ def normalize_text(text: str) -> str:
     return text.strip()
 
 
+MONTHS_NL_SHORT = {
+    "jan": 1, "feb": 2, "maa": 3, "apr": 4, "mei": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "okt": 10, "nov": 11, "dec": 12,
+}
+
+
+def document_period_index(value: str) -> int | None:
+    """Return months since 2000 for '11-2026' / 'november 2026' style periods in a link."""
+    lowered = value.lower()
+    match = re.search(r"(?<!\d)(0?[1-9]|1[0-2])[-_./](20\d{2})(?!\d)", lowered)
+    if match:
+        return (int(match.group(2)) - 2000) * 12 + int(match.group(1))
+    match = re.search(r"([a-z]{3})[a-z]*[\s_-]+(20\d{2})(?!\d)", lowered)
+    if match and match.group(1) in MONTHS_NL_SHORT:
+        return (int(match.group(2)) - 2000) * 12 + MONTHS_NL_SHORT[match.group(1)]
+    return None
+
+
 def discover_child_document_links(base_url: str, max_links: int = 12) -> list[str]:
     """Find likely tariff-card child links, preferring PDFs and explicit pricing docs."""
     try:
         response = request_with_retry(base_url)
-    except Exception:
+    except Exception as exc:
+        print(f"[WARN] Kon {base_url} niet openen voor documentzoektocht: {exc}", flush=True)
         return []
 
     soup = BeautifulSoup(response.text, "html.parser")
@@ -543,6 +569,13 @@ def discover_child_document_links(base_url: str, max_links: int = 12) -> list[st
             score -= 30
         if "blog" in haystack or "inspiratie" in haystack:
             score -= 80
+        if absolute.lower().endswith(".pdf") and re.search(
+            r"algemene-?voorwaarden|parameters", absolute, re.IGNORECASE
+        ):
+            continue
+        period = document_period_index(haystack)
+        if period is not None:
+            score += period * 5
 
         seen.add(absolute)
         candidates.append((score, absolute))
@@ -643,25 +676,25 @@ def extract_best_effort_prices(
         detail_rows: list[dict] = []
 
         try:
-            if fast_mode:
-                candidate_urls = [source_url] if isinstance(source_url, str) and source_url else []
-            else:
-                # Full mode checks known seed pages and follows tariff documents.
-                seed_urls = DIRECT_TARIFF_SEEDS.get(supplier, [])
-                candidate_urls = []
-                seen_candidates: set[str] = set()
-                for candidate_url in seed_urls + [source_url]:
-                    if candidate_url and candidate_url not in seen_candidates:
-                        seen_candidates.add(candidate_url)
-                        candidate_urls.append(candidate_url)
+            # Check known seed pages and follow tariff documents (PDFs) on them.
+            seed_urls = DIRECT_TARIFF_SEEDS.get(supplier, [])
+            candidate_urls = []
+            seen_candidates: set[str] = set()
+            for candidate_url in [source_url] + seed_urls:
+                if isinstance(candidate_url, str) and candidate_url and candidate_url not in seen_candidates:
+                    seen_candidates.add(candidate_url)
+                    candidate_urls.append(candidate_url)
 
-                child_links: list[str] = []
-                for start_url in candidate_urls[:3]:
-                    for child in discover_child_document_links(start_url):
-                        if child not in seen_candidates:
-                            seen_candidates.add(child)
-                            child_links.append(child)
-                candidate_urls.extend(child_links)
+            child_links: list[str] = []
+            for start_url in candidate_urls[:3]:
+                if start_url.lower().endswith(".pdf"):
+                    continue
+                for child in discover_child_document_links(start_url, max_links=6 if fast_mode else 12):
+                    if child not in seen_candidates:
+                        seen_candidates.add(child)
+                        child_links.append(child)
+            # Documents first: tariff cards hold the actual prices.
+            candidate_urls = child_links + candidate_urls
 
             best_candidate = None
             best_candidate_details = []
@@ -676,11 +709,13 @@ def extract_best_effort_prices(
                         )
                     else:
                         source_text, source_type, content_type = fetch_source_text(candidate_url)
-                except Exception:
+                except Exception as exc:
+                    print(f"[WARN] {supplier}: {candidate_url} niet uitgelezen: {exc}", flush=True)
                     continue
 
                 normalized_text = normalize_text(source_text)
                 if not normalized_text:
+                    print(f"[WARN] {supplier}: {candidate_url} bevat geen tekst", flush=True)
                     continue
 
                 candidate_values, candidate_details = extract_fields_from_text(
@@ -717,8 +752,14 @@ def extract_best_effort_prices(
                     extracted["extraction_note"] = f"{extracted['fields_found']}_fields_found"
 
         except Exception as exc:
+            print(f"[ERROR] {supplier}: uitlezen mislukt: {exc}", flush=True)
             extracted["extraction_note"] = f"error: {exc}"
 
+        print(
+            f"[RESULT] {supplier}: {extracted['extraction_note']} "
+            f"({extracted.get('matched_url') or source_url})",
+            flush=True,
+        )
         return index, extracted, detail_rows
 
     comparison_rows: list[dict | None] = [None] * len(indexed_rows)
@@ -748,10 +789,9 @@ def scrape_tables_from_url(url: str) -> pd.DataFrame:
     """Read HTML tables from a page and flatten into a row-based table."""
     try:
         tables = pd.read_html(url)
-    except Exception:
+    except Exception as exc:
+        print(f"[WARN] HTML-tabellen van {url} niet gelezen: {exc}", flush=True)
         return pd.DataFrame()
-
-    rows = []
     for index, table in enumerate(tables, start=1):
         table = table.copy()
         table.columns = [str(col).strip() for col in table.columns]
@@ -828,6 +868,17 @@ def collect_all_discovered_links(
                 continue
             seen.add(candidate)
             links.append(candidate)
+
+        # Second level: tariff cards (PDFs) usually sit on a tariff subpage, not on the start page.
+        subpages = [
+            link for link in links
+            if not link.lower().endswith(".pdf") and re.search(r"tarie|prijs|price", link, re.IGNORECASE)
+        ]
+        for subpage in subpages[:5]:
+            for document in discover_child_document_links(subpage, max_links=8):
+                if document not in seen and document.lower().endswith(".pdf"):
+                    seen.add(document)
+                    links.append(document)
 
         if not links:
             discovered_rows.append(
@@ -944,6 +995,10 @@ def select_best_url_per_supplier(curated_urls_df: pd.DataFrame, qualification_df
         for term, points in penalty_terms.items():
             if term in value:
                 score += points
+
+        period = document_period_index(value)
+        if period is not None:
+            score += period * 5
 
         return score
 

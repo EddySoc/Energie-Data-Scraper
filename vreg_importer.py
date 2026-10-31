@@ -18,6 +18,7 @@ import argparse
 import io
 import html
 import re
+import sys
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -67,7 +68,12 @@ GAS_RATE_COMPONENTS = {
     "Enkelvoudige meter dagtarief (c€/kWh)": "gas_rate",
 }
 
-DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "scraper_data"
+APP_DIR = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+)
+DEFAULT_DATA_DIR = APP_DIR / "scraper_data"
 OUTPUT_FILE = DEFAULT_DATA_DIR / "be_vreg_vergelijking.xlsx"
 
 

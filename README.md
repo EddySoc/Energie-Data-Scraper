@@ -20,7 +20,11 @@ python energy_viewer.py
 
 Gebruik **Tarieven bijwerken** in het dashboard om de Fluvius-, VREG- en leveranciersgegevens bij te werken. De eerste update kan langer duren omdat de leveranciers-URL's dan nog niet in de lokale cache staan.
 
-De gegevens worden lokaal opgeslagen in `scraper_data/` en persoonlijke dashboardexports in `User_Data/`. Deze mappen worden bewust niet naar GitHub gepusht.
+De gegevens worden lokaal opgeslagen in `scraper_data/` en persoonlijke dashboardexports in `user_data/`. Deze mappen worden bewust niet naar GitHub gepusht.
+
+### Portable Windows-app
+
+Plaats `energy_viewer.exe` in een schrijfbare map. De app leest en schrijft gegevens in de submappen `scraper_data/` en `user_data/` naast de executable, onafhankelijk van de huidige werkmap. De onefile-build maakt deze mappen bij de eerste start aan en vult ontbrekende startbestanden in `scraper_data/` aan. Bestaande bestanden worden daarbij niet overschreven. Neem bij het verplaatsen van de app de twee datamappen mee om je gegevens en exports te behouden.
 
 ## Screenshots
 

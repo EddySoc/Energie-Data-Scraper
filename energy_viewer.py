@@ -1,8 +1,11 @@
+import contextlib
 import math
 import re
+import shutil
 import subprocess
 import sys
 import threading
+import traceback
 import unicodedata
 import webbrowser
 import tkinter as tk
@@ -18,11 +21,41 @@ from openpyxl.utils.exceptions import InvalidFileException
 from openpyxl.worksheet.properties import PageSetupProperties
 
 from energy_scraper import (
+    main as run_energy_scraper,
     parse_energy_rate_to_eur_per_kwh,
     parse_standing_charge_to_eur_per_year,
 )
+from fluvius_nettarieven_importer import (
+    OUTPUT_CSV as FLUVIUS_OUTPUT_CSV,
+    update_fluvius_rates,
+)
+from vreg_importer import OUTPUT_FILE as VREG_OUTPUT_FILE
+from vreg_importer import main as run_vreg_importer
 
 BASE_DIR = Path(__file__).resolve().parent
+APP_DIR = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else BASE_DIR
+)
+
+
+def _prepare_portable_data_dirs() -> None:
+    scraper_data_dir = APP_DIR / "scraper_data"
+    user_data_dir = APP_DIR / "user_data"
+    scraper_data_dir.mkdir(parents=True, exist_ok=True)
+    user_data_dir.mkdir(parents=True, exist_ok=True)
+
+    if getattr(sys, "frozen", False):
+        bundle_root = getattr(sys, "_MEIPASS", None)
+        bundled_data_dir = Path(bundle_root) / "scraper_data" if bundle_root else None
+        if bundled_data_dir is not None and bundled_data_dir.is_dir():
+            for source in bundled_data_dir.rglob("*"):
+                if source.is_file():
+                    destination = scraper_data_dir / source.relative_to(bundled_data_dir)
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    if not destination.exists():
+                        shutil.copy2(source, destination)
 
 CSV_TABS = [
     ("Leveranciers", "be_supplier_qualification.csv"),
@@ -43,6 +76,23 @@ VREG_COLUMNS = {
 }
 
 DASHBOARD_SNAPSHOT_VERSION = 1
+SCAN_LOG_NAME = "scan_log.txt"
+
+
+class _LogWriter:
+    """File-like object that forwards text written by in-process scans to the scan log."""
+
+    def __init__(self, target) -> None:
+        self.target = target
+
+    def write(self, text: str) -> int:
+        if self.target is not None and text:
+            self.target.write(text)
+            self.target.flush()
+        return len(text)
+
+    def flush(self) -> None:
+        pass
 
 
 def _finite_number(value: object) -> float | None:
@@ -80,6 +130,52 @@ def _vreg_price(value: object, unit: str) -> str | None:
     return f"{number:.6f}".rstrip("0").rstrip(".") + f" {unit}"
 
 
+PRICE_DATA_COLUMNS = (
+    "electricity_single_rate",
+    "electricity_day_rate",
+    "electricity_night_rate",
+    "gas_rate",
+    "standing_charge",
+    "electricity_standing_charge",
+    "gas_standing_charge",
+)
+
+
+def load_supplier_discounts(path: Path) -> dict[str, tuple[float, float]]:
+    """Read per-supplier yearly discounts (electricity, gas) in EUR from a CSV file."""
+    if not path.is_file():
+        return {}
+    try:
+        df = pd.read_csv(path, encoding="utf-8-sig", sep=None, engine="python")
+    except (OSError, pd.errors.ParserError, pd.errors.EmptyDataError):
+        return {}
+    if "supplier" not in df.columns:
+        return {}
+    discounts: dict[str, tuple[float, float]] = {}
+    for row in df.to_dict("records"):
+        if row.get("supplier") is None or pd.isna(row.get("supplier")):
+            continue
+        values = []
+        for column in ("electricity_discount_eur_year", "gas_discount_eur_year"):
+            value = _finite_number(str(row.get(column, "")).replace(",", "."))
+            values.append(value if value is not None and value > 0 else 0.0)
+        key = _supplier_key(row["supplier"])
+        previous = discounts.get(key, (0.0, 0.0))
+        discounts[key] = (previous[0] + values[0], previous[1] + values[1])
+    return discounts
+
+
+def drop_suppliers_without_data(prices: pd.DataFrame) -> pd.DataFrame:
+    """Remove suppliers for which no price or standing charge is known."""
+    columns = [column for column in PRICE_DATA_COLUMNS if column in prices.columns]
+    if prices.empty or not columns:
+        return prices
+    has_data = prices[columns].apply(
+        lambda col: col.notna() & col.astype(str).str.strip().ne("")
+    ).any(axis=1)
+    return prices[has_data].reset_index(drop=True)
+
+
 def combine_price_sources(
     scraped: pd.DataFrame,
     vreg: pd.DataFrame,
@@ -97,12 +193,19 @@ def combine_price_sources(
     vreg = vreg[vreg["Leverancier"].notna()].copy()
     vreg["Leverancier"] = vreg["Leverancier"].astype(str).str.strip()
     vreg = vreg[~vreg["Leverancier"].str.startswith("Bron:", na=False)]
+    # Teruglevering-rijen bevatten injectievergoedingen, geen afnametarieven.
     is_feed_in = vreg["Product stroom"].astype(str).str.contains(
         "terugleververgoeding|teruglevering",
         case=False,
         na=False,
     )
-    vreg.loc[is_feed_in, list(VREG_COLUMNS)] = None
+    if "Contracttype" in vreg.columns:
+        is_feed_in |= vreg["Contracttype"].astype(str).str.contains(
+            "teruglever|injectie",
+            case=False,
+            na=False,
+        )
+    vreg = vreg[~is_feed_in].copy()
     vreg["_supplier_key"] = vreg["Leverancier"].map(_supplier_key)
 
     def annual_estimate(row: pd.Series) -> float:
@@ -517,6 +620,7 @@ class DashboardTab(ttk.Frame):
         super().__init__(master, padding=8)
         self.overview = pd.DataFrame()
         self.network_rates = pd.DataFrame()
+        self.discounts: dict[str, tuple[float, float]] = {}
         self.network_source = None
         self.network_load_error = ""
         self.electric_row = None
@@ -730,10 +834,25 @@ class DashboardTab(ttk.Frame):
             variable.trace_add("write", lambda *_: self.recalc())
         for variable in self.options.values():
             variable.trace_add("write", lambda *_: self.recalc())
-        self.electric_supplier.trace_add("write", lambda *_: self.recalc())
-        self.gas_supplier.trace_add("write", lambda *_: self.recalc())
+        self.electric_supplier.trace_add("write", lambda *_: self._apply_supplier_discount())
+        self.gas_supplier.trace_add("write", lambda *_: self._apply_supplier_discount())
         self.network_zone.trace_add("write", lambda *_: self.recalc())
         self.recalc()
+
+    def set_discounts(self, discounts: dict[str, tuple[float, float]]) -> None:
+        self.discounts = discounts
+        self._apply_supplier_discount()
+
+    def _apply_supplier_discount(self) -> None:
+        """Prefill the discount field from the discount file for the chosen suppliers."""
+        electric = self.discounts.get(_supplier_key(self.electric_supplier.get()), (0.0, 0.0))[0]
+        gas = self.discounts.get(_supplier_key(self.gas_supplier.get()), (0.0, 0.0))[1]
+        total = electric + gas
+        text = f"{total:.2f}".rstrip("0").rstrip(".").replace(".", ",") if total else "0"
+        if self.profile_vars["discount"].get() != text:
+            self.profile_vars["discount"].set(text)
+        else:
+            self.recalc()
 
     def _add_combo(self, parent, row: int, label: str, variable: tk.StringVar) -> None:
         ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=6, pady=3)
@@ -1144,6 +1263,10 @@ class DashboardTab(ttk.Frame):
         self.total_var.set(f"Totaal incl. btw: {self._euro(total)}")
         monthly = total / 12 if total is not None else None
         self.monthly_var.set(f"Per maand: {self._euro(monthly)}")
+        self._publish_breakdown(
+            electricity_cost_ex_green_wkk, green_power_cost, wkk_cost, fixed_electric,
+            gas_cost, fixed_gas, discount, network_costs, network_row is not None, vat_rate,
+        )
 
         if network_row is not None:
             tariff_stamp = f" (import: {tariff_year})" if tariff_year and tariff_year != "nan" else ""
@@ -1219,7 +1342,49 @@ class DashboardTab(ttk.Frame):
             caveats.append("De gevonden vaste vergoeding is niet per stroom/gas uitgesplitst.")
         self.status_var.set(" ".join(caveats))
 
+    def _publish_breakdown(
+        self, electricity, green, wkk, fixed_electric, gas, fixed_gas, discount,
+        network_costs, has_network, vat_rate,
+    ) -> None:
+        """Group all costs into supplier / network / taxes columns for the summary tab."""
+        callback = getattr(self, "on_breakdown", None)
+        if callback is None:
+            return
+
+        def total(*values):
+            if any(value is None for value in values):
+                return None
+            return sum(values)
+
+        n = network_costs
+        rows = {
+            "Stroom": (
+                total(electricity, green, wkk, fixed_electric),
+                total(n["electricity_distribution"], n["capacity"], n["electricity_data"])
+                if has_network else None,
+                total(n["electricity_odv"], n["electricity_surcharges"]) if has_network else None,
+            ),
+            "Gas": (
+                total(gas, fixed_gas),
+                total(n["gas_distribution"], n["gas_fixed_term"], n["gas_data"])
+                if has_network else None,
+                total(n["gas_odv"], n["gas_other_levies"]) if has_network else None,
+            ),
+            "Korting": (-discount if discount else 0.0, 0.0, 0.0),
+        }
+        subtotal = []
+        for column in range(3):
+            known = [rows[name][column] for name in rows if rows[name][column] is not None]
+            has_values = any(rows[name][column] is not None for name in ("Stroom", "Gas"))
+            subtotal.append(sum(known) if has_values else None)
+        excl_vat = sum(value for value in subtotal if value is not None)
+        vat = excl_vat * vat_rate / 100.0
+        callback((rows, subtotal, vat, vat_rate))
+
     def _clear_results(self) -> None:
+        callback = getattr(self, "on_breakdown", None)
+        if callback is not None:
+            callback(None)
         for variable in self.result_vars.values():
             variable.set("—")
         self.total_var.set("Totaal incl. btw: —")
@@ -1272,12 +1437,244 @@ class DashboardTab(ttk.Frame):
         self.recalc()
 
 
+class DiscountTab(ttk.Frame):
+    """View and edit yearly supplier discounts stored in leverancier_kortingen.csv."""
+
+    COLUMNS = (
+        ("supplier", "Leverancier", 300),
+        ("electricity", "Korting stroom (€/jaar)", 160),
+        ("gas", "Korting gas (€/jaar)", 160),
+        ("note", "Opmerking", 400),
+    )
+
+    def __init__(self, master, on_saved):
+        super().__init__(master)
+        self.on_saved = on_saved
+        self.path: Path | None = None
+        self.rows: dict[str, dict[str, str]] = {}
+
+        ttk.Label(
+            self,
+            text=(
+                "Kortingen zitten niet in de VREG-data. Selecteer een leverancier, pas de bedragen aan "
+                "en klik 'Toepassen'; 'Opslaan' schrijft ze naar leverancier_kortingen.csv. "
+                "Ze worden automatisch ingevuld in het dashboard."
+            ),
+            wraplength=1100,
+        ).pack(fill="x", padx=8, pady=(8, 4))
+
+        self.tree = ttk.Treeview(
+            self, columns=[c[0] for c in self.COLUMNS], show="headings", height=14, selectmode="browse"
+        )
+        for key, title, width in self.COLUMNS:
+            self.tree.heading(key, text=title)
+            self.tree.column(key, width=width, anchor="w")
+        self.tree.pack(fill="both", expand=True, padx=8, pady=4)
+        self.tree.bind("<<TreeviewSelect>>", lambda *_: self._load_selected())
+
+        form = ttk.Frame(self)
+        form.pack(fill="x", padx=8, pady=4)
+        self.supplier_var = tk.StringVar()
+        self.electricity_var = tk.StringVar()
+        self.gas_var = tk.StringVar()
+        self.note_var = tk.StringVar()
+        ttk.Label(form, textvariable=self.supplier_var, font=("Segoe UI", 10, "bold")).grid(
+            row=0, column=0, columnspan=6, sticky="w", pady=(0, 4)
+        )
+        for column, (label, variable, width) in enumerate(
+            (
+                ("Stroom €/jaar", self.electricity_var, 10),
+                ("Gas €/jaar", self.gas_var, 10),
+                ("Opmerking", self.note_var, 40),
+            )
+        ):
+            ttk.Label(form, text=label).grid(row=1, column=column * 2, sticky="w", padx=(0, 4))
+            ttk.Entry(form, textvariable=variable, width=width).grid(
+                row=1, column=column * 2 + 1, sticky="w", padx=(0, 12)
+            )
+        ttk.Button(form, text="Toepassen", command=self._apply).grid(row=1, column=6, padx=4)
+        ttk.Button(form, text="Opslaan", command=self.save).grid(row=1, column=7, padx=4)
+        self.status_var = tk.StringVar()
+        ttk.Label(self, textvariable=self.status_var, foreground="#9C5700").pack(fill="x", padx=8, pady=(0, 6))
+
+    def load(self, path: Path, suppliers: list[str]) -> None:
+        self.path = path
+        self.rows = {}
+        if path.is_file():
+            try:
+                df = pd.read_csv(path, encoding="utf-8-sig", sep=None, engine="python", dtype=str)
+            except (OSError, pd.errors.ParserError, pd.errors.EmptyDataError):
+                df = pd.DataFrame()
+            if "supplier" in df.columns:
+                for record in df.fillna("").to_dict("records"):
+                    name = str(record["supplier"]).strip()
+                    if name:
+                        self.rows[_supplier_key(name)] = {
+                            "supplier": name,
+                            "electricity": str(record.get("electricity_discount_eur_year", "")).strip(),
+                            "gas": str(record.get("gas_discount_eur_year", "")).strip(),
+                            "note": str(record.get("note", "")).strip(),
+                        }
+        for name in suppliers:
+            self.rows.setdefault(
+                _supplier_key(name), {"supplier": name, "electricity": "", "gas": "", "note": ""}
+            )
+        self._render()
+
+    def _render(self, select: str | None = None) -> None:
+        self.tree.delete(*self.tree.get_children())
+        for key, row in sorted(self.rows.items(), key=lambda item: item[1]["supplier"].casefold()):
+            self.tree.insert(
+                "", "end", iid=key,
+                values=(row["supplier"], row["electricity"], row["gas"], row["note"]),
+            )
+        if select and select in self.rows:
+            self.tree.selection_set(select)
+
+    def _load_selected(self) -> None:
+        selection = self.tree.selection()
+        if not selection:
+            return
+        row = self.rows[selection[0]]
+        self.supplier_var.set(row["supplier"])
+        self.electricity_var.set(row["electricity"])
+        self.gas_var.set(row["gas"])
+        self.note_var.set(row["note"])
+
+    @staticmethod
+    def _amount(text: str, label: str) -> str:
+        text = text.strip()
+        if not text:
+            return ""
+        value = _finite_number(text.replace(",", "."))
+        if value is None or value < 0:
+            raise ValueError(f"{label}: voer een positief bedrag in.")
+        return f"{value:.2f}".rstrip("0").rstrip(".")
+
+    def _apply(self) -> bool:
+        selection = self.tree.selection()
+        if not selection:
+            self.status_var.set("Selecteer eerst een leverancier.")
+            return False
+        try:
+            electricity = self._amount(self.electricity_var.get(), "Stroom")
+            gas = self._amount(self.gas_var.get(), "Gas")
+        except ValueError as exc:
+            self.status_var.set(str(exc))
+            return False
+        key = selection[0]
+        self.rows[key].update(
+            electricity=electricity, gas=gas, note=self.note_var.get().strip()
+        )
+        self._render(select=key)
+        self.status_var.set("Toegepast; klik 'Opslaan' om te bewaren.")
+        return True
+
+    def save(self) -> None:
+        if self.tree.selection() and not self._apply():
+            return
+        if self.path is None:
+            return
+        records = [
+            {
+                "supplier": row["supplier"],
+                "electricity_discount_eur_year": row["electricity"],
+                "gas_discount_eur_year": row["gas"],
+                "note": row["note"],
+            }
+            for row in self.rows.values()
+            if row["electricity"] or row["gas"] or row["note"]
+        ]
+        try:
+            pd.DataFrame(
+                records,
+                columns=["supplier", "electricity_discount_eur_year", "gas_discount_eur_year", "note"],
+            ).to_csv(self.path, index=False, encoding="utf-8-sig")
+        except OSError as exc:
+            self.status_var.set(f"Opslaan mislukt: {exc}")
+            return
+        self.status_var.set(f"Opgeslagen in {self.path}")
+        self.on_saved(load_supplier_discounts(self.path))
+
+
+class SummaryTab(ttk.Frame):
+    """Cost overview grouped in supplier, network and taxes/levies columns."""
+
+    HEADERS = ("", "Leverancier", "Netwerk (Fluvius)", "Taksen, accijnzen & heffingen", "Totaal")
+
+    def __init__(self, master):
+        super().__init__(master)
+        ttk.Label(
+            self,
+            text=(
+                "Leverancier: energie, groene stroom/WKK, vaste kosten en korting. "
+                "Netwerk: distributie, capaciteit, vaste netvergoeding en databeheer. "
+                "Taksen: ODV-heffing, toeslagen, overige heffingen en btw. "
+                "Alle bedragen per jaar, gebaseerd op het Dashboard."
+            ),
+            wraplength=1100,
+        ).pack(fill="x", padx=8, pady=(8, 4))
+        self.grid_frame = ttk.Frame(self)
+        self.grid_frame.pack(anchor="nw", padx=8, pady=8)
+        self.render(None)
+
+    @staticmethod
+    def _euro(value: float | None) -> str:
+        if value is None:
+            return "—"
+        return f"€ {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+    def render(self, data) -> None:
+        for child in self.grid_frame.winfo_children():
+            child.destroy()
+        for column, header in enumerate(self.HEADERS):
+            ttk.Label(self.grid_frame, text=header, font=("TkDefaultFont", 10, "bold"), width=28 if column else 14,
+                      anchor="e" if column else "w").grid(row=0, column=column, padx=6, pady=4, sticky="e")
+        if data is None:
+            return
+        rows, subtotal, vat, vat_rate = data
+
+        def add_row(row_index: int, label: str, values, bold: bool = False) -> None:
+            font = ("TkDefaultFont", 10, "bold") if bold else ("TkDefaultFont", 10)
+            ttk.Label(self.grid_frame, text=label, font=font).grid(row=row_index, column=0, sticky="w", padx=6, pady=3)
+            known = [value for value in values if value is not None]
+            cells = [*values, sum(known) if known else None]
+            for column, value in enumerate(cells, start=1):
+                ttk.Label(self.grid_frame, text=self._euro(value), font=font, anchor="e", width=28).grid(
+                    row=row_index, column=column, sticky="e", padx=6, pady=3
+                )
+
+        row_index = 1
+        for name, values in rows.items():
+            add_row(row_index, name, values)
+            row_index += 1
+        ttk.Separator(self.grid_frame, orient="horizontal").grid(
+            row=row_index, column=0, columnspan=5, sticky="ew", pady=3
+        )
+        add_row(row_index + 1, "Totaal excl. btw", subtotal, bold=True)
+        add_row(row_index + 2, f"Btw ({vat_rate:g}%)", (None, None, vat))
+        grand = [*subtotal]
+        grand[2] = (grand[2] or 0.0) + vat if (grand[2] is not None or vat) else None
+        add_row(row_index + 3, "Totaal incl. btw", grand, bold=True)
+        monthly = [None if value is None else value / 12 for value in grand]
+        add_row(row_index + 4, "Per maand", monthly)
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Belgische energieprijzen — overzicht")
         self.geometry("1300x900+0+0")
-        self.folder = BASE_DIR
+        self.folder = APP_DIR
+        try:
+            _prepare_portable_data_dirs()
+        except OSError as exc:
+            messagebox.showerror(
+                "Portable gegevensmappen",
+                f"Gegevensmappen naast de app konden niet worden klaargemaakt:\n{exc}",
+                parent=self,
+            )
+            raise
 
         bar = ttk.Frame(self)
         bar.pack(fill="x", padx=6, pady=6)
@@ -1316,8 +1713,14 @@ class App(tk.Tk):
 
         self.dashboard = DashboardTab(self.nb)
         self.nb.add(self.dashboard, text="Dashboard")
+        self.summary_tab = SummaryTab(self.nb)
+        self.nb.add(self.summary_tab, text="Kostenoverzicht")
+        self.dashboard.on_breakdown = self.summary_tab.render
+        self.dashboard.recalc()
         self.comparison = ComparisonTab(self.nb)
         self.nb.add(self.comparison, text="Vergelijking")
+        self.discount_tab = DiscountTab(self.nb, lambda d: self.dashboard.set_discounts(d))
+        self.nb.add(self.discount_tab, text="Kortingen")
         self.tables: dict[str, DataTable] = {}
         for title, _ in CSV_TABS:
             t = DataTable(self.nb)
@@ -1344,14 +1747,14 @@ class App(tk.Tk):
                 loaded += 1
             except (FileNotFoundError, pd.errors.EmptyDataError):
                 df = pd.DataFrame()
-            self.tables[title].set_data(df)
             if name == "be_energy_price_comparison.csv":
                 scraped_prices = df
+                df = drop_suppliers_without_data(df)
+            self.tables[title].set_data(df)
 
         vreg_paths = (
             self.folder / "scraper_data" / "be_vreg_vergelijking.xlsx",
             self.folder / "be_vreg_vergelijking.xlsx",
-            BASE_DIR / "scraper_data" / "be_vreg_vergelijking.xlsx",
         )
         vreg_path = next((path for path in vreg_paths if path.is_file()), None)
         vreg_status = ""
@@ -1377,13 +1780,13 @@ class App(tk.Tk):
                 vreg_status = f"VREG-data niet gebruikt: {exc}"
         else:
             vreg_status = "Geen VREG-vergelijking gevonden; alleen leveranciersscrape gebruikt."
+        combined_prices = drop_suppliers_without_data(combined_prices)
         self.dashboard.set_data(combined_prices)
         self.comparison.set_data(combined_prices)
 
         network_paths = (
             self.folder / "scraper_data" / "fluvius_nettarieven_latest.csv",
             self.folder / "fluvius_nettarieven_latest.csv",
-            BASE_DIR / "scraper_data" / "fluvius_nettarieven_latest.csv",
         )
         network_path = next((path for path in network_paths if path.is_file()), None)
         network_df = pd.DataFrame()
@@ -1412,17 +1815,30 @@ class App(tk.Tk):
         else:
             network_error = "Geen Fluvius-tariefbestand gevonden; kies 'Nettarieven bijwerken'."
         self.dashboard.set_network_data(network_df, network_path, network_error)
+        discount_paths = (
+            self.folder / "scraper_data" / "leverancier_kortingen.csv",
+            self.folder / "leverancier_kortingen.csv",
+        )
+        discount_path = next((path for path in discount_paths if path.is_file()), discount_paths[-1])
+        self.dashboard.set_discounts(load_supplier_discounts(discount_path))
+        supplier_names = (
+            combined_prices["supplier"].dropna().astype(str).tolist()
+            if "supplier" in combined_prices.columns
+            else []
+        )
+        self.discount_tab.load(discount_path, supplier_names)
         self.status.config(
             text=f"{loaded}/{len(CSV_TABS)} CSV's geladen uit {self.folder} — {vreg_status}"
         )
 
     def update_all_rates(self, *, full_discovery: bool = False):
-        fluvius_importer = BASE_DIR / "fluvius_nettarieven_importer.py"
-        vreg_importer = BASE_DIR / "vreg_importer.py"
-        scraper = BASE_DIR / "energy_scraper.py"
-        scripts = (fluvius_importer, vreg_importer, scraper)
+        scripts = (
+            BASE_DIR / "fluvius_nettarieven_importer.py",
+            BASE_DIR / "vreg_importer.py",
+            BASE_DIR / "energy_scraper.py",
+        )
         missing = [str(script) for script in scripts if not script.is_file()]
-        if missing:
+        if missing and not getattr(sys, "frozen", False):
             messagebox.showerror(
                 "Tarieven bijwerken",
                 "Deze benodigde scripts zijn niet gevonden:\n" + "\n".join(missing),
@@ -1436,46 +1852,46 @@ class App(tk.Tk):
         self.status.config(text="Tarieven bijwerken wordt voorbereid…")
 
         data_dir = self.folder / "scraper_data"
-        scraper_command = [sys.executable, "-u", str(scraper)]
-        if not full_discovery:
-            scraper_command.append("--reuse-discovery")
         steps = (
+            "Fluvius-nettarieven",
+            "VREG-data",
             (
-                "Fluvius-nettarieven",
-                [
-                    sys.executable,
-                    str(fluvius_importer),
-                    "--output-dir",
-                    str(data_dir.resolve()),
-                ],
-                self.folder,
-            ),
-            (
-                "VREG-data",
-                [
-                    sys.executable,
-                    str(vreg_importer),
-                    "--output-dir",
-                    str(data_dir.resolve()),
-                ],
-                self.folder,
-            ),
-            (
-                (
-                    "Volledige leveranciersscan"
-                    if full_discovery
-                    else "Leveranciersprijzen (URL-cache)"
-                ),
-                scraper_command,
-                self.folder,
+                "Volledige leveranciersscan"
+                if full_discovery
+                else "Leveranciersprijzen (URL-cache)"
             ),
         )
 
+        def run_frozen_step(label: str) -> None:
+            writer = _LogWriter(log_file)
+            with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
+                if label == "Fluvius-nettarieven":
+                    update_fluvius_rates(data_dir / FLUVIUS_OUTPUT_CSV)
+                elif label == "VREG-data":
+                    run_vreg_importer(data_dir / VREG_OUTPUT_FILE.name)
+                else:
+                    run_energy_scraper(reuse_discovery=not full_discovery)
+
+        log_file = None
+
+        def log(text: str) -> None:
+            if log_file is not None:
+                log_file.write(text.rstrip("\n") + "\n")
+                log_file.flush()
+
         def worker():
+            nonlocal log_file
             failures = []
             try:
                 data_dir.mkdir(parents=True, exist_ok=True)
-                for label, command, working_directory in steps:
+                try:
+                    log_file = open(data_dir / SCAN_LOG_NAME, "w", encoding="utf-8")
+                except OSError:
+                    log_file = None
+                log(f"Scan gestart: {datetime.now():%Y-%m-%d %H:%M:%S}")
+                log(f"Modus: {'volledige bronzoektocht' if full_discovery else 'URL-cache'}")
+                for label in steps:
+                    log(f"\n=== {label} ({datetime.now():%H:%M:%S}) ===")
                     self.after(
                         0,
                         lambda current_step=label: self.status.config(
@@ -1483,11 +1899,18 @@ class App(tk.Tk):
                         ),
                     )
                     try:
-                        if label.startswith(("Volledige leveranciersscan", "Leveranciersprijzen")):
+                        if getattr(sys, "frozen", False):
+                            run_frozen_step(label)
+                            return_code = 0
+                            output = ""
+                        elif label.startswith(("Volledige leveranciersscan", "Leveranciersprijzen")):
+                            command = [sys.executable, "-u", str(scripts[2])]
+                            if not full_discovery:
+                                command.append("--reuse-discovery")
                             recent_output = []
                             with subprocess.Popen(
                                 command,
-                                cwd=working_directory,
+                                cwd=self.folder,
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT,
                                 text=True,
@@ -1497,6 +1920,7 @@ class App(tk.Tk):
                             ) as process:
                                 if process.stdout is not None:
                                     for output_line in process.stdout:
+                                        log(output_line)
                                         progress = output_line.strip()
                                         if progress:
                                             recent_output.append(progress)
@@ -1510,29 +1934,43 @@ class App(tk.Tk):
                                 return_code = process.wait()
                                 output = "\n".join(recent_output)
                         else:
+                            script = scripts[0] if label == "Fluvius-nettarieven" else scripts[1]
                             result = subprocess.run(
-                                command,
-                                cwd=working_directory,
+                                [
+                                    sys.executable,
+                                    str(script),
+                                    "--output-dir",
+                                    str(data_dir.resolve()),
+                                ],
+                                cwd=self.folder,
                                 capture_output=True,
                                 text=True,
                             )
                             return_code = result.returncode
+                            log(result.stdout)
+                            log(result.stderr)
                             output = result.stderr.strip() or result.stdout.strip()
-                    except OSError as exc:
+                    except Exception as exc:
                         failures.append(f"{label}: {exc}")
+                        log(f"[ERROR] {label}: {exc}")
+                        log(traceback.format_exc())
                         continue
+                    log(f"--- {label}: exitcode {return_code}")
                     if return_code != 0:
                         output = output or "Geen foutdetails ontvangen."
                         failures.append(f"{label} mislukt:\n{output[-1200:]}")
             except OSError as exc:
                 failures.append(f"Datamap scraper_data kon niet worden klaargemaakt:\n{exc}")
+            log(f"\nScan klaar: {datetime.now():%Y-%m-%d %H:%M:%S}; {len(failures)} mislukte stap(pen)")
+            if log_file is not None:
+                log_file.close()
             self.after(0, lambda: self._rates_update_done(failures))
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _refresh_vreg_on_start(self) -> None:
         importer = BASE_DIR / "vreg_importer.py"
-        if not importer.is_file():
+        if not importer.is_file() and not getattr(sys, "frozen", False):
             messagebox.showerror("VREG-data", f"Importer niet gevonden:\n{importer}", parent=self)
             return
         self.update_rates_btn.state(["disabled"])
@@ -1542,22 +1980,27 @@ class App(tk.Tk):
 
         def worker():
             try:
-                result = subprocess.run(
-                    [
-                        sys.executable,
-                        str(importer),
-                        "--output-dir",
-                        str((self.folder / "scraper_data").resolve()),
-                    ],
-                    cwd=self.folder,
-                    capture_output=True,
-                    text=True,
-                )
-                error = ""
-                if result.returncode != 0:
-                    output = result.stderr.strip() or result.stdout.strip() or "Geen foutdetails ontvangen."
-                    error = f"VREG-data bijwerken mislukt:\n{output[-1200:]}"
-            except OSError as exc:
+                output_file = self.folder / "scraper_data" / VREG_OUTPUT_FILE.name
+                if getattr(sys, "frozen", False):
+                    run_vreg_importer(output_file)
+                    error = ""
+                else:
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            str(importer),
+                            "--output-dir",
+                            str((self.folder / "scraper_data").resolve()),
+                        ],
+                        cwd=self.folder,
+                        capture_output=True,
+                        text=True,
+                    )
+                    error = ""
+                    if result.returncode != 0:
+                        output = result.stderr.strip() or result.stdout.strip() or "Geen foutdetails ontvangen."
+                        error = f"VREG-data bijwerken mislukt:\n{output[-1200:]}"
+            except Exception as exc:
                 error = f"VREG-data bijwerken mislukt: {exc}"
             self.after(0, lambda: self._startup_vreg_done(error))
 
@@ -1582,14 +2025,18 @@ class App(tk.Tk):
             self.status.config(text="Tarieven bijwerken afgerond met fouten; zie details.")
             messagebox.showerror(
                 "Tarieven bijwerken",
-                "Niet alle gegevens konden worden bijgewerkt:\n\n" + details,
+                "Niet alle gegevens konden worden bijgewerkt:\n\n"
+                + details
+                + f"\n\nVolledig logboek: {self.folder / 'scraper_data' / SCAN_LOG_NAME}",
                 parent=self,
             )
         else:
-            self.status.config(text="Fluvius-nettarieven, VREG-data en leveranciersprijzen zijn bijgewerkt.")
+            self.status.config(
+                text=f"Alles bijgewerkt. Logboek: {self.folder / 'scraper_data' / SCAN_LOG_NAME}"
+            )
 
     def _dashboard_data_dir(self) -> Path:
-        return self.folder / "User_Data"
+        return self.folder / "user_data"
 
     def export_dashboard(self):
         data_dir = self._dashboard_data_dir()

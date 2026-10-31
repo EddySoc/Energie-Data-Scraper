@@ -11,6 +11,7 @@ import argparse
 from datetime import datetime
 import io
 import re
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -20,7 +21,12 @@ from openpyxl import load_workbook
 ELEC_PAGE = "https://www.fluvius.be/nl/factuur-en-tarieven/netkosten/netkosten-afname-elektriciteit"
 GAS_PAGE = "https://www.fluvius.be/nl/factuur-en-tarieven/netkosten/netkosten-afname-aardgas"
 OUTPUT_CSV = "fluvius_nettarieven_latest.csv"
-DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "scraper_data"
+APP_DIR = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+)
+DEFAULT_DATA_DIR = APP_DIR / "scraper_data"
 
 ZONE_SLUG_TO_NAME = {
     "fluvius-antwerpen": "Fluvius Antwerpen",
